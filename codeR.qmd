@@ -1,0 +1,967 @@
+---
+title: Causual inference
+format: html
+editor: visual
+---
+
+```{r}
+# 01_core_prepare_data.R
+# Revised core specification for causal analysis
+
+# 0. Packages
+
+required_packages <- c(
+  "tidyverse",
+  "janitor",
+  "tableone"
+)
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) install.packages(new_packages)
+
+file_path <- file.choose()
+library(tidyverse)
+library(janitor)
+library(readxl)
+
+credit_raw <- read_csv(file_path, show_col_types = FALSE) %>%
+  clean_names()
+
+dim(credit_raw)
+names(credit_raw)
+
+
+# 2. Check columns
+
+required_cols <- c(
+  "id", "limit_bal", "sex", "education", "marriage", "age",
+  "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6",
+  "default_payment_next_month"
+)
+
+missing_cols <- setdiff(required_cols, names(credit_raw))
+missing_cols
+
+
+# 3. Clean data
+
+credit_clean <- credit_raw %>%
+  distinct() %>%
+  mutate(
+    education = case_when(
+      education %in% c(0, 5, 6) ~ 4L,
+      TRUE ~ as.integer(education)
+    ),
+    marriage = case_when(
+      marriage == 0 ~ 3L,
+      TRUE ~ as.integer(marriage)
+    ),
+    default_next_month = as.integer(default_payment_next_month)
+  ) %>%
+  select(-id, -default_payment_next_month)
+
+# 4. Recode factors
+
+credit_clean <- credit_clean %>%
+  mutate(
+    sex = factor(sex, levels = c(1, 2), labels = c("male", "female")),
+    education = factor(
+      education,
+      levels = c(1, 2, 3, 4),
+      labels = c("graduate_school", "university", "high_school", "other")
+    ),
+    marriage = factor(
+      marriage,
+      levels = c(1, 2, 3),
+      labels = c("married", "single", "other")
+    )
+  )
+
+# 5. Create treatment
+
+limit_cutoff_median <- median(credit_clean$limit_bal, na.rm = TRUE)
+limit_cutoff_p75 <- quantile(credit_clean$limit_bal, 0.75, na.rm = TRUE)
+
+credit_clean <- credit_clean %>%
+  mutate(
+    high_limit = if_else(limit_bal > limit_cutoff_median, 1L, 0L),
+    high_limit_p75 = if_else(limit_bal > limit_cutoff_p75, 1L, 0L)
+  )
+
+
+# 6. Core covariates
+
+core_cov_demo  <- c("sex", "education", "marriage", "age")
+core_cov_repay <- c("pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6")
+
+core_covariates <- c(core_cov_demo, core_cov_repay)
+
+core_covariates
+length(core_covariates)
+
+# 7. Core analysis dataset
+
+analysis_core <- credit_clean %>%
+  select(
+    default_next_month,
+    high_limit,
+    high_limit_p75,
+    limit_bal,
+    all_of(core_covariates)
+  )
+
+dim(analysis_core)
+names(analysis_core)
+
+# 8. Quick descriptive checks
+
+cat("\n===== DATA SHAPE =====\n")
+print(dim(credit_clean))
+print(dim(analysis_core))
+
+cat("\n===== DEFAULT RATE =====\n")
+print(mean(credit_clean$default_next_month))
+
+cat("\n===== TREATMENT SPLIT: MEDIAN =====\n")
+print(table(credit_clean$high_limit))
+print(prop.table(table(credit_clean$high_limit)))
+
+cat("\n===== TREATMENT SPLIT: P75 =====\n")
+print(table(credit_clean$high_limit_p75))
+print(prop.table(table(credit_clean$high_limit_p75)))
+
+cat("\n===== LIMIT SUMMARY BY TREATMENT =====\n")
+print(tapply(credit_clean$limit_bal, credit_clean$high_limit, summary))
+
+# 9. Baseline balance table (CORE only)
+vars_for_balance_core <- c(
+  "age", "sex", "education", "marriage",
+  "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6"
+)
+
+factor_vars_core <- c("sex", "education", "marriage")
+
+tab_core <- CreateTableOne(
+  vars = vars_for_balance_core,
+  strata = "high_limit",
+  data = credit_clean,
+  factorVars = factor_vars_core,
+  test = TRUE
+)
+
+cat("\n===== BASELINE BALANCE TABLE: CORE =====\n")
+print(tab_core, smd = TRUE)
+
+# 10. Save files
+write_csv(credit_clean, "credit_clean_revised.csv")
+write_csv(analysis_core, "analysis_core.csv")
+
+saveRDS(core_covariates, "core_covariates.rds")
+saveRDS(tab_core, "tab_core_balance.rds")
+
+cat("\n===== SAVED FILES =====\n")
+cat("credit_clean_revised.csv\n")
+cat("analysis_core.csv\n")
+cat("core_covariates.rds\n")
+cat("tab_core_balance.rds\n")
+```
+
+```{r}
+# 02_core_psm_ipw.R
+# Revised core PSM + IPW
+
+# -------------------------
+# 0. Packages
+# -------------------------
+required_packages <- c(
+  "tidyverse",
+  "MatchIt",
+  "cobalt",
+  "broom"
+)
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) install.packages(new_packages)
+
+library(tidyverse)
+library(MatchIt)
+library(cobalt)
+library(broom)
+
+# -------------------------
+# 1. Read prepared data
+# -------------------------
+credit_clean <- read_csv("credit_clean_revised.csv", show_col_types = FALSE)
+analysis_core <- read_csv("analysis_core.csv", show_col_types = FALSE)
+core_covariates <- readRDS("core_covariates.rds")
+
+# recode factor variables after reloading csv
+credit_clean <- credit_clean %>%
+  mutate(
+    sex = factor(sex),
+    education = factor(education),
+    marriage = factor(marriage)
+  )
+
+analysis_core <- analysis_core %>%
+  mutate(
+    sex = factor(sex),
+    education = factor(education),
+    marriage = factor(marriage)
+  )
+
+# -------------------------
+# 2. Propensity score model (CORE)
+# -------------------------
+ps_formula_core <- as.formula(
+  paste("high_limit ~", paste(core_covariates, collapse = " + "))
+)
+
+ps_model_core <- glm(
+  ps_formula_core,
+  data = credit_clean,
+  family = binomial(link = "logit")
+)
+
+summary(ps_model_core)
+
+credit_clean$pscore_core <- predict(ps_model_core, type = "response")
+
+cat("\n===== PROPENSITY SCORE SUMMARY =====\n")
+print(summary(credit_clean$pscore_core))
+
+cat("\n===== PROPENSITY SCORE BY TREATMENT =====\n")
+print(tapply(credit_clean$pscore_core, credit_clean$high_limit, summary))
+
+cat("\n===== RANGE BY TREATMENT =====\n")
+print(range(credit_clean$pscore_core[credit_clean$high_limit == 0]))
+print(range(credit_clean$pscore_core[credit_clean$high_limit == 1]))
+
+# -------------------------
+# 3. Plot overlap
+# -------------------------
+p_ps <- ggplot(credit_clean, aes(x = pscore_core, fill = factor(high_limit))) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Propensity Score Distribution by Treatment Group (Core Specification)",
+    x = "Propensity score",
+    fill = "Treatment"
+  ) +
+  theme_minimal()
+
+print(p_ps)
+ggsave("core_pscore_distribution.png", p_ps, width = 8, height = 5, dpi = 300)
+
+# -------------------------
+# 4. PSM: nearest neighbor
+# -------------------------
+m_core <- matchit(
+  ps_formula_core,
+  data = credit_clean,
+  method = "nearest",
+  distance = "logit",
+  replace = FALSE
+)
+
+cat("\n===== MATCHING SUMMARY: NEAREST =====\n")
+print(summary(m_core, standardize = TRUE))
+
+# -------------------------
+# 5. PSM: caliper matching
+# -------------------------
+m_core_cal <- matchit(
+  ps_formula_core,
+  data = credit_clean,
+  method = "nearest",
+  distance = "logit",
+  replace = FALSE,
+  caliper = 0.2
+)
+
+cat("\n===== MATCHING SUMMARY: CALIPER =====\n")
+print(summary(m_core_cal, standardize = TRUE))
+
+# Love plot
+p_love <- love.plot(m_core_cal, binary = "std")
+png("core_love_plot_psm_caliper.png", width = 1000, height = 800)
+love.plot(m_core_cal, binary = "std")
+dev.off()
+
+# -------------------------
+# 6. Matched data and ATT
+# -------------------------
+matched_core_cal <- match.data(m_core_cal)
+
+cat("\n===== MATCHED SAMPLE SIZE =====\n")
+print(dim(matched_core_cal))
+print(table(matched_core_cal$high_limit))
+print(prop.table(table(matched_core_cal$high_limit)))
+
+cat("\n===== DEFAULT RATE IN MATCHED SAMPLE =====\n")
+print(with(matched_core_cal, tapply(default_next_month, high_limit, mean)))
+
+att_core_psm <- with(
+  matched_core_cal,
+  mean(default_next_month[high_limit == 1]) -
+    mean(default_next_month[high_limit == 0])
+)
+
+cat("\n===== ATT FROM CORE PSM =====\n")
+print(att_core_psm)
+
+glm_core_matched <- glm(
+  default_next_month ~ high_limit,
+  data = matched_core_cal,
+  family = binomial()
+)
+
+cat("\n===== LOGIT ON MATCHED SAMPLE =====\n")
+print(summary(glm_core_matched))
+cat("\n===== ODDS RATIO (MATCHED LOGIT) =====\n")
+print(exp(coef(glm_core_matched)))
+
+# -------------------------
+# 7. IPW: stabilized weights
+# -------------------------
+p_treat <- mean(credit_clean$high_limit == 1)
+p_ctrl  <- 1 - p_treat
+
+credit_clean <- credit_clean %>%
+  mutate(
+    sw_ate_core = if_else(
+      high_limit == 1,
+      p_treat / pscore_core,
+      p_ctrl / (1 - pscore_core)
+    )
+  )
+
+cap_sw_core <- quantile(credit_clean$sw_ate_core, 0.99, na.rm = TRUE)
+
+credit_clean <- credit_clean %>%
+  mutate(
+    sw_ate_core_trim = pmin(sw_ate_core, cap_sw_core)
+  )
+
+cat("\n===== STABILIZED WEIGHTS SUMMARY =====\n")
+print(summary(credit_clean$sw_ate_core_trim))
+print(quantile(
+  credit_clean$sw_ate_core_trim,
+  probs = c(0.01, 0.05, 0.5, 0.95, 0.99),
+  na.rm = TRUE
+))
+
+hist(credit_clean$sw_ate_core_trim, breaks = 50)
+boxplot(credit_clean$sw_ate_core_trim)
+
+# -------------------------
+# 8. Balance after weighting
+# -------------------------
+bal_core_ipw <- bal.tab(
+  high_limit ~ age + sex + education + marriage +
+    pay_0 + pay_2 + pay_3 + pay_4 + pay_5 + pay_6,
+  data = credit_clean,
+  weights = credit_clean$sw_ate_core_trim,
+  method = "weighting",
+  estimand = "ATE",
+  un = TRUE
+)
+
+cat("\n===== BALANCE AFTER CORE IPW =====\n")
+print(bal_core_ipw)
+
+png("core_love_plot_ipw.png", width = 1000, height = 800)
+love.plot(
+  high_limit ~ age + sex + education + marriage +
+    pay_0 + pay_2 + pay_3 + pay_4 + pay_5 + pay_6,
+  data = credit_clean,
+  weights = credit_clean$sw_ate_core_trim,
+  method = "weighting",
+  estimand = "ATE",
+  binary = "std"
+)
+dev.off()
+
+# -------------------------
+# 9. ATE from IPW
+# -------------------------
+yt_core <- with(
+  subset(credit_clean, high_limit == 1),
+  weighted.mean(default_next_month, w = sw_ate_core_trim)
+)
+
+yc_core <- with(
+  subset(credit_clean, high_limit == 0),
+  weighted.mean(default_next_month, w = sw_ate_core_trim)
+)
+
+ate_core_ipw <- yt_core - yc_core
+
+cat("\n===== CORE IPW ATE =====\n")
+print(yt_core)
+print(yc_core)
+print(ate_core_ipw)
+
+m_core_ipw <- glm(
+  default_next_month ~ high_limit,
+  data = credit_clean,
+  family = binomial(),
+  weights = sw_ate_core_trim
+)
+
+cat("\n===== WEIGHTED LOGIT (CORE IPW) =====\n")
+print(summary(m_core_ipw))
+cat("\n===== ODDS RATIO (CORE IPW LOGIT) =====\n")
+print(exp(coef(m_core_ipw)))
+
+# -------------------------
+# 10. Save outputs
+# -------------------------
+write_csv(credit_clean, "credit_clean_core_ps.csv")
+write_csv(matched_core_cal, "matched_core_cal.csv")
+
+saveRDS(ps_model_core, "ps_model_core.rds")
+saveRDS(m_core, "m_core.rds")
+saveRDS(m_core_cal, "m_core_cal.rds")
+saveRDS(glm_core_matched, "glm_core_matched.rds")
+saveRDS(m_core_ipw, "m_core_ipw.rds")
+
+core_result_summary <- data.frame(
+  method = c("PSM ATT (core)", "IPW ATE (core)"),
+  estimate = c(att_core_psm, ate_core_ipw)
+)
+
+write.csv(core_result_summary, "core_result_summary.csv", row.names = FALSE)
+
+cat("\n===== SAVED FILES =====\n")
+cat("credit_clean_core_ps.csv\n")
+cat("matched_core_cal.csv\n")
+cat("ps_model_core.rds\n")
+cat("m_core.rds\n")
+cat("m_core_cal.rds\n")
+cat("glm_core_matched.rds\n")
+cat("m_core_ipw.rds\n")
+cat("core_result_summary.csv\n")
+```
+
+```{r}
+# =========================================================
+# 03_core_causal_forest.R
+# Revised core Causal Forest
+# =========================================================
+
+# -------------------------
+# 0. Packages
+# -------------------------
+required_packages <- c(
+  "tidyverse",
+  "grf",
+  "ggplot2"
+)
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) install.packages(new_packages)
+
+library(tidyverse)
+library(grf)
+library(ggplot2)
+
+# -------------------------
+# 1. Read prepared data
+# -------------------------
+credit_clean <- read_csv("credit_clean_revised.csv", show_col_types = FALSE)
+analysis_core <- read_csv("analysis_core.csv", show_col_types = FALSE)
+core_covariates <- readRDS("core_covariates.rds")
+
+# recode factor variables after reloading csv
+analysis_core <- analysis_core %>%
+  mutate(
+    sex = factor(sex),
+    education = factor(education),
+    marriage = factor(marriage)
+  )
+
+# -------------------------
+# 2. Prepare X, Y, W
+# -------------------------
+Y <- analysis_core$default_next_month
+W <- analysis_core$high_limit
+
+X <- model.matrix(
+  as.formula(paste("~", paste(core_covariates, collapse = " + "))),
+  data = analysis_core
+)[, -1, drop = FALSE]
+
+cat("\n===== X Y W DIMENSIONS =====\n")
+print(dim(X))
+print(length(Y))
+print(length(W))
+
+# -------------------------
+# 3. Nuisance models
+# -------------------------
+y.forest <- regression_forest(X, Y)
+w.forest <- regression_forest(X, W)
+
+Y.hat <- predict(y.forest)$predictions
+W.hat <- predict(w.forest)$predictions
+
+cat("\n===== W.HAT SUMMARY BEFORE TRIMMING =====\n")
+print(summary(W.hat))
+print(range(W.hat))
+
+# Trim extreme propensity estimates
+W.hat <- pmin(pmax(W.hat, 0.01), 0.99)
+
+cat("\n===== W.HAT SUMMARY AFTER TRIMMING =====\n")
+print(summary(W.hat))
+print(range(W.hat))
+
+# -------------------------
+# 4. Train causal forest
+# -------------------------
+set.seed(123)
+
+cf_core <- causal_forest(
+  X = X,
+  Y = Y,
+  W = W,
+  Y.hat = Y.hat,
+  W.hat = W.hat,
+  num.trees = 2000,
+  honesty = TRUE,
+  seed = 123
+)
+
+# -------------------------
+# 5. ATE estimates
+# -------------------------
+ate_core_all <- average_treatment_effect(cf_core, target.sample = "all")
+ate_core_overlap <- average_treatment_effect(cf_core, target.sample = "overlap")
+
+cat("\n===== CORE CF ATE (ALL SAMPLE) =====\n")
+print(ate_core_all)
+
+cat("\n===== CORE CF ATE (OVERLAP SAMPLE) =====\n")
+print(ate_core_overlap)
+
+# -------------------------
+# 6. CATE predictions
+# -------------------------
+tau_hat_core <- predict(cf_core)$predictions
+
+cat("\n===== CORE CATE SUMMARY =====\n")
+print(summary(tau_hat_core))
+cat("\n===== CORE MEAN CATE =====\n")
+print(mean(tau_hat_core))
+
+# attach to data
+analysis_core$cate_hat <- tau_hat_core
+
+# -------------------------
+# 7. CATE distribution plots
+# -------------------------
+p_hist <- ggplot(analysis_core, aes(x = cate_hat)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of estimated CATE (Core Specification)",
+    x = "Estimated CATE",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+print(p_hist)
+ggsave("core_cf_cate_distribution.png", p_hist, width = 8, height = 5, dpi = 300)
+
+p_density <- ggplot(analysis_core, aes(x = cate_hat)) +
+  geom_density() +
+  labs(
+    title = "Density of estimated CATE (Core Specification)",
+    x = "Estimated CATE",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+print(p_density)
+ggsave("core_cf_cate_density.png", p_density, width = 8, height = 5, dpi = 300)
+
+# -------------------------
+# 8. Quartiles of CATE
+# -------------------------
+analysis_core <- analysis_core %>%
+  mutate(
+    cate_quartile = ntile(cate_hat, 4)
+  )
+
+cate_quartile_summary <- analysis_core %>%
+  group_by(cate_quartile) %>%
+  summarise(
+    mean_cate = mean(cate_hat),
+    mean_default = mean(default_next_month),
+    mean_limit = mean(limit_bal),
+    n = n(),
+    .groups = "drop"
+  )
+
+cat("\n===== CATE QUARTILE SUMMARY =====\n")
+print(cate_quartile_summary)
+
+# -------------------------
+# 9. Variable importance
+# -------------------------
+var_imp_core <- variable_importance(cf_core)
+
+varimp_core_df <- data.frame(
+  variable = colnames(X),
+  importance = var_imp_core
+) %>%
+  arrange(desc(importance))
+
+cat("\n===== TOP 15 VARIABLE IMPORTANCE =====\n")
+print(head(varimp_core_df, 15))
+
+p_varimp <- varimp_core_df %>%
+  slice_max(order_by = importance, n = 15) %>%
+  ggplot(aes(x = reorder(variable, importance), y = importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 15 Variable Importance in Causal Forest (Core)",
+    x = "Variable",
+    y = "Importance"
+  ) +
+  theme_minimal()
+
+print(p_varimp)
+ggsave("core_cf_variable_importance.png", p_varimp, width = 8, height = 5, dpi = 300)
+
+# -------------------------
+# 10. Simple subgroup heterogeneity
+# -------------------------
+# Age groups
+analysis_core <- analysis_core %>%
+  mutate(
+    age_group = case_when(
+      age < 30 ~ "under_30",
+      age >= 30 & age < 40 ~ "30_39",
+      age >= 40 & age < 50 ~ "40_49",
+      TRUE ~ "50_plus"
+    )
+  )
+
+subgroup_age_core <- analysis_core %>%
+  group_by(age_group) %>%
+  summarise(
+    mean_cate = mean(cate_hat),
+    sd_cate = sd(cate_hat),
+    n = n(),
+    .groups = "drop"
+  )
+
+cat("\n===== SUBGROUP AGE (CORE) =====\n")
+print(subgroup_age_core)
+
+# Repayment history groups
+analysis_core <- analysis_core %>%
+  mutate(
+    pay0_group = case_when(
+      pay_0 <= 0 ~ "on_time_or_early",
+      pay_0 == 1 ~ "1_month_delay",
+      pay_0 >= 2 ~ "serious_delay"
+    )
+  )
+
+subgroup_pay0_core <- analysis_core %>%
+  group_by(pay0_group) %>%
+  summarise(
+    mean_cate = mean(cate_hat),
+    sd_cate = sd(cate_hat),
+    n = n(),
+    .groups = "drop"
+  )
+
+cat("\n===== SUBGROUP PAY0 (CORE) =====\n")
+print(subgroup_pay0_core)
+
+# -------------------------
+# 11. Policy rule
+# -------------------------
+analysis_core$recommend_highlimit <- ifelse(analysis_core$cate_hat < 0, 1, 0)
+
+cat("\n===== SIMPLE POLICY RULE =====\n")
+print(table(analysis_core$recommend_highlimit))
+print(prop.table(table(analysis_core$recommend_highlimit)))
+
+# -------------------------
+# 12. Save outputs
+# -------------------------
+write_csv(analysis_core, "analysis_core_with_cate.csv")
+write.csv(cate_quartile_summary, "cate_quartile_summary_core.csv", row.names = FALSE)
+write.csv(varimp_core_df, "varimp_core_df.csv", row.names = FALSE)
+write.csv(subgroup_age_core, "subgroup_age_core.csv", row.names = FALSE)
+write.csv(subgroup_pay0_core, "subgroup_pay0_core.csv", row.names = FALSE)
+
+saveRDS(cf_core, "cf_core.rds")
+saveRDS(y.forest, "y_forest_core.rds")
+saveRDS(w.forest, "w_forest_core.rds")
+
+cat("\n===== SAVED FILES =====\n")
+cat("analysis_core_with_cate.csv\n")
+cat("cate_quartile_summary_core.csv\n")
+cat("varimp_core_df.csv\n")
+cat("subgroup_age_core.csv\n")
+cat("subgroup_pay0_core.csv\n")
+cat("cf_core.rds\n")
+cat("y_forest_core.rds\n")
+cat("w_forest_core.rds\n")
+```
+
+```{r}
+#install.packages("EValue")
+library(EValue)
+
+beta_psm <- coef(glm_core_matched)["high_limit"]
+se_psm   <- summary(glm_core_matched)$coefficients["high_limit", "Std. Error"]
+
+or_psm <- exp(beta_psm)
+ci_low_psm  <- exp(beta_psm - 1.96 * se_psm)
+ci_high_psm <- exp(beta_psm + 1.96 * se_psm)
+
+or_psm
+ci_low_psm
+ci_high_psm
+
+evalues.OR(
+  est = or_psm,
+  lo = ci_low_psm,
+  hi = ci_high_psm,
+  rare = FALSE
+)
+```
+
+```{r}
+beta_ipw <- coef(m_core_ipw)["high_limit"]
+se_ipw   <- summary(m_core_ipw)$coefficients["high_limit", "Std. Error"]
+
+or_ipw <- exp(beta_ipw)
+ci_low_ipw  <- exp(beta_ipw - 1.96 * se_ipw)
+ci_high_ipw <- exp(beta_ipw + 1.96 * se_ipw)
+
+or_ipw
+ci_low_ipw
+ci_high_ipw
+
+evalues.OR(
+  est = or_ipw,
+  lo = ci_low_ipw,
+  hi = ci_high_ipw,
+  rare = FALSE
+)
+```
+
+```{r}
+set.seed(123)
+
+n_sim <- 500
+placebo_est <- numeric(n_sim)
+
+for (i in 1:n_sim) {
+  placebo_treat <- sample(credit_clean$high_limit)
+  
+  m_placebo <- glm(
+    default_next_month ~ placebo_treat + age + sex + education + marriage +
+      pay_0 + pay_2 + pay_3 + pay_4 + pay_5 + pay_6,
+    data = credit_clean,
+    family = binomial()
+  )
+  
+  placebo_est[i] <- coef(m_placebo)["placebo_treat"]
+}
+
+summary(placebo_est)
+
+logit_core_full <- glm(
+  default_next_month ~ high_limit + age + sex + education + marriage +
+    pay_0 + pay_2 + pay_3 + pay_4 + pay_5 + pay_6,
+  data = credit_clean,
+  family = binomial()
+)
+
+real_est <- coef(logit_core_full)["high_limit"]
+real_est
+
+hist(placebo_est, breaks = 40,
+     main = "Placebo distribution of treatment estimates",
+     xlab = "Placebo treatment coefficient")
+abline(v = real_est, col = "red", lwd = 2)
+```
+
+```{r}
+# =========================================================
+# BENCHMARK LOGIT MODELS - CORE SPECIFICATION
+# =========================================================
+
+library(tidyverse)
+library(broom)
+
+# Đọc dữ liệu đã làm sạch
+credit_clean <- readr::read_csv("credit_clean_revised.csv", show_col_types = FALSE)
+
+# recode lại factor nếu cần
+credit_clean <- credit_clean %>%
+  mutate(
+    sex = factor(sex),
+    education = factor(education),
+    marriage = factor(marriage)
+  )
+
+# -------------------------
+# Logit 1: chỉ treatment
+# -------------------------
+logit_1 <- glm(
+  default_next_month ~ high_limit,
+  data = credit_clean,
+  family = binomial()
+)
+
+# -------------------------
+# Logit 2: thêm demographic covariates
+# -------------------------
+logit_2 <- glm(
+  default_next_month ~ high_limit + age + sex + education + marriage,
+  data = credit_clean,
+  family = binomial()
+)
+
+# -------------------------
+# Logit 3: core benchmark model
+# demographic + repayment history
+# -------------------------
+logit_3 <- glm(
+  default_next_month ~ high_limit + age + sex + education + marriage +
+    pay_0 + pay_2 + pay_3 + pay_4 + pay_5 + pay_6,
+  data = credit_clean,
+  family = binomial()
+)
+
+# -------------------------
+# Xem summary từng mô hình
+# -------------------------
+summary(logit_1)
+summary(logit_2)
+summary(logit_3)
+
+# -------------------------
+# Trích riêng hệ số high_limit
+# -------------------------
+benchmark_results <- bind_rows(
+  tidy(logit_1) %>% mutate(model = "Logit 1"),
+  tidy(logit_2) %>% mutate(model = "Logit 2"),
+  tidy(logit_3) %>% mutate(model = "Logit 3")
+) %>%
+  filter(term == "high_limit") %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    conf.low.or = exp(estimate - 1.96 * std.error),
+    conf.high.or = exp(estimate + 1.96 * std.error)
+  ) %>%
+  select(model, term, estimate, std.error, statistic, p.value,
+         odds_ratio, conf.low.or, conf.high.or)
+
+benchmark_results
+library(ggplot2)
+
+benchmark_plot <- benchmark_results %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  )
+
+ggplot(benchmark_plot, aes(x = model, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.15) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Benchmark logit estimates for high_limit",
+    x = "Model",
+    y = "Coefficient of high_limit"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# =========================================================
+# BEFORE vs AFTER MATCHING TABLE (CORE SPECIFICATION)
+# =========================================================
+
+# Nếu chưa cài:
+# install.packages(c("tidyverse", "MatchIt"))
+
+library(tidyverse)
+library(MatchIt)
+
+# -------------------------
+# 1. Đọc dữ liệu
+# -------------------------
+credit_clean <- readr::read_csv("credit_clean_revised.csv", show_col_types = FALSE)
+
+# recode factor variables
+credit_clean <- credit_clean %>%
+  mutate(
+    sex = factor(sex),
+    education = factor(education),
+    marriage = factor(marriage)
+  )
+
+# -------------------------
+# 2. Tạo công thức propensity score core
+# -------------------------
+core_covariates <- c(
+  "sex", "education", "marriage", "age",
+  "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6"
+)
+
+ps_formula_core <- as.formula(
+  paste("high_limit ~", paste(core_covariates, collapse = " + "))
+)
+
+# -------------------------
+# 3. Chạy caliper matching
+# -------------------------
+m_core_cal <- matchit(
+  ps_formula_core,
+  data = credit_clean,
+  method = "nearest",
+  distance = "logit",
+  replace = FALSE,
+  caliper = 0.2
+)
+
+# -------------------------
+# 4. Lấy summary matching
+# -------------------------
+sum_core_cal <- summary(m_core_cal, standardize = TRUE)
+
+# -------------------------
+# 5. Tạo bảng before-after SMD
+# -------------------------
+before_after_smd <- data.frame(
+  Variable = rownames(sum_core_cal$sum.all),
+  SMD_Before = sum_core_cal$sum.all[, "Std. Mean Diff."],
+  SMD_After  = sum_core_cal$sum.matched[, "Std. Mean Diff."]
+) %>%
+  mutate(
+    SMD_Before = round(SMD_Before, 4),
+    SMD_After  = round(SMD_After, 4),
+    Improvement = round(abs(SMD_Before) - abs(SMD_After), 4)
+  )
+
+before_after_smd
+before_after_focus <- before_after_smd %>%
+  dplyr::filter(Variable %in% c(
+    "age", "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6",
+    "sexfemale", "educationgraduate_school", "educationuniversity",
+    "educationhigh_school", "marriagemarried", "marriagesingle"
+  ))
+
+before_after_focus
+```
